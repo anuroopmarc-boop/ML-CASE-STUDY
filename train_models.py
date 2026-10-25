@@ -9,6 +9,7 @@ Outputs (saved to ./models/):
     clf_pipeline.pkl   – Random Forest Classifier pipeline (employee promotion)
     reg_meta.pkl       – dict with column lists, caps, dept_means etc.
     clf_meta.pkl       – dict with column lists, caps, dept_means etc.
+    cluster_data.pkl   – scaler, PCA, K-Means model, cluster archetypes, metrics
 """
 
 import os, warnings, joblib
@@ -21,6 +22,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
@@ -245,5 +249,104 @@ clf_meta = {
 joblib.dump(pipeline_clf, "models/clf_pipeline.pkl")
 joblib.dump(clf_meta, "models/clf_meta.pkl")
 print("  Saved: models/clf_pipeline.pkl  models/clf_meta.pkl")
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. CLUSTERING  –  Customer Segmentation (Marketing Campaign)
+# ─────────────────────────────────────────────────────────────
 print()
-print("Done! [OK]  All models saved to ./models/")
+print("=" * 60)
+print("CLUSTERING: Customer Segmentation (Marketing Campaign)")
+print("=" * 60)
+
+CLUST_DATA = os.path.join("DATASET", "marketing_campaign.csv")
+df_cl = pd.read_csv(CLUST_DATA, sep="\t")
+if df_cl.shape[1] == 1:
+    df_cl = pd.read_csv(CLUST_DATA)
+
+df_cl = df_cl.drop(columns=["Z_CostContact", "Z_Revenue", "ID"], errors="ignore").drop_duplicates().reset_index(drop=True)
+df_cl["Income"] = df_cl["Income"].fillna(df_cl.groupby("Education")["Income"].transform("median"))
+df_cl = df_cl[(df_cl["Year_Birth"] >= 1940) & (df_cl["Income"] <= 150000)].reset_index(drop=True)
+
+df_cl["Dt_Customer"] = pd.to_datetime(df_cl["Dt_Customer"], dayfirst=True, format="mixed")
+SNAPSHOT_CL = df_cl["Dt_Customer"].max() + pd.Timedelta(days=1)
+
+spend_cols = ["MntWines", "MntFruits", "MntMeatProducts", "MntFishProducts", "MntSweetProducts", "MntGoldProds"]
+purchase_cols = ["NumDealsPurchases", "NumWebPurchases", "NumCatalogPurchases", "NumStorePurchases"]
+
+df_cl["Age"] = SNAPSHOT_CL.year - df_cl["Year_Birth"]
+df_cl["Tenure_days"] = (SNAPSHOT_CL - df_cl["Dt_Customer"]).dt.days
+df_cl["TotalSpend"] = df_cl[spend_cols].sum(axis=1)
+df_cl["TotalPurchases"] = df_cl[purchase_cols].sum(axis=1)
+df_cl["Children"] = df_cl["Kidhome"] + df_cl["Teenhome"]
+df_cl["Family_Size"] = df_cl["Children"] + df_cl["Marital_Status"].isin(["Married", "Together"]).astype(int) + 1
+df_cl["AvgOrderValue"] = (df_cl["TotalSpend"] / df_cl["TotalPurchases"].replace(0, np.nan)).fillna(0)
+df_cl["WineShare"] = (df_cl["MntWines"] / df_cl["TotalSpend"].replace(0, np.nan)).fillna(0)
+df_cl["Education_level"] = df_cl["Education"].replace({"2n Cycle": "Master", "Graduation": "Graduate", "Basic": "Undergraduate"})
+df_cl["Living_With_Partner"] = df_cl["Marital_Status"].isin(["Married", "Together"]).astype(int)
+
+cluster_num = ["Age", "Income", "Tenure_days", "Recency", "Children", "Family_Size",
+               "TotalSpend", "TotalPurchases", "AvgOrderValue", "WineShare",
+               "MntWines", "MntFruits", "MntMeatProducts", "MntFishProducts",
+               "MntSweetProducts", "MntGoldProds",
+               "NumDealsPurchases", "NumWebPurchases", "NumCatalogPurchases",
+               "NumStorePurchases", "NumWebVisitsMonth"]
+cluster_cat = ["Education_level"]
+
+X_cl = pd.get_dummies(df_cl[cluster_num + cluster_cat + ["Living_With_Partner"]],
+                      columns=cluster_cat, drop_first=True)
+features_cl = list(X_cl.columns)
+
+scaler_cl = StandardScaler()
+X_scaled_cl = scaler_cl.fit_transform(X_cl.astype(float))
+
+pca2_cl = PCA(n_components=2, random_state=RANDOM_STATE)
+X_pca_cl = pca2_cl.fit_transform(X_scaled_cl)
+
+kmeans4 = KMeans(n_clusters=4, n_init=20, random_state=RANDOM_STATE).fit(X_scaled_cl)
+labels4 = kmeans4.labels_
+
+cluster_names = {
+    0: "Tier 1: High-Income Premium Spenders",
+    1: "Tier 2: Wine & Luxury Enthusiasts",
+    2: "Tier 3: Value-Conscious Family Shoppers",
+    3: "Tier 4: Entry-Level Occasional Buyers",
+}
+
+cluster_descriptions = {
+    0: "Customers with high annual income (> £75k) and high spend across wine, meats, and catalogs. Less reliant on discounts with maximum customer lifetime value.",
+    1: "Moderate to high income customers (> £55k) who heavily favor wine (accounting for ~60% of total spend) and frequent in-store visits.",
+    2: "Family-oriented middle income (~ £35k) customers with children, seeking discounts and value deals through online and catalog purchases.",
+    3: "Entry level or budget conscious (~ £20k income) with small basket sizes and low purchase frequency.",
+}
+
+sample_idx = np.random.RandomState(RANDOM_STATE).choice(len(X_pca_cl), size=min(600, len(X_pca_cl)), replace=False)
+pca_plot_data = {
+    "x": X_pca_cl[sample_idx, 0].tolist(),
+    "y": X_pca_cl[sample_idx, 1].tolist(),
+    "cluster": [cluster_names[l] for l in labels4[sample_idx]],
+    "income": df_cl.iloc[sample_idx]["Income"].tolist(),
+    "spend": df_cl.iloc[sample_idx]["TotalSpend"].tolist(),
+}
+
+cluster_data = {
+    "scaler": scaler_cl,
+    "pca2": pca2_cl,
+    "kmeans": kmeans4,
+    "features": features_cl,
+    "cluster_num": cluster_num,
+    "cluster_names": cluster_names,
+    "cluster_descriptions": cluster_descriptions,
+    "pca_plot_data": pca_plot_data,
+    "means": X_cl.mean().to_dict(),
+    "metrics": {
+        "Silhouette": round(silhouette_score(X_scaled_cl, labels4), 4),
+        "Davies_Bouldin": round(davies_bouldin_score(X_scaled_cl, labels4), 4),
+        "Calinski_Harabasz": round(calinski_harabasz_score(X_scaled_cl, labels4), 1),
+    },
+}
+
+joblib.dump(cluster_data, "models/cluster_data.pkl")
+print("  Saved: models/cluster_data.pkl")
+print()
+print("Done! [OK]  All models (Regression, Classification, Clustering) saved to ./models/")
